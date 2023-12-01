@@ -15,6 +15,7 @@
 """Model a set of read-only queries to a database as a snapshot."""
 
 import functools
+import itertools
 import threading
 from google.protobuf.struct_pb2 import Struct
 from google.cloud.spanner_v1 import ExecuteSqlRequest
@@ -447,38 +448,31 @@ class _SnapshotBase(_SessionWrapper):
         if self._transaction_id is None:
             # lock is added to handle the inline begin for first rpc
             with self._lock:
-                iterator = _restart_on_unavailable(
-                    restart,
-                    request,
-                    "CloudSpanner.ReadWriteTransaction",
-                    self._session,
-                    trace_attributes,
-                    transaction=self,
-                )
-                self._read_request_count += 1
-                self._execute_sql_count += 1
-
-                if self._multi_use:
-                    return StreamedResultSet(iterator, source=self)
-                else:
-                    return StreamedResultSet(iterator)
+                self._temp(restart, request, trace_attributes)
         else:
-            iterator = _restart_on_unavailable(
-                restart,
-                request,
-                "CloudSpanner.ReadWriteTransaction",
-                self._session,
-                trace_attributes,
-                transaction=self,
-            )
+            self._temp(restart, request, trace_attributes)
 
+    def _temp(self, restart, request, trace_attributes):
+        iterator = _restart_on_unavailable(
+            restart,
+            request,
+            "CloudSpanner.ReadWriteTransaction",
+            self._session,
+            trace_attributes,
+            transaction=self,
+        )
         self._read_request_count += 1
         self._execute_sql_count += 1
+
+        # temp_iterator = next(iterator)
+        # if temp_iterator.metadata.transaction.read_timestamp is not None:
+        #     self._transaction_read_timestamp = temp_iterator.metadata.transaction.read_timestamp
 
         if self._multi_use:
             return StreamedResultSet(iterator, source=self)
         else:
             return StreamedResultSet(iterator)
+
 
     def partition_read(
         self,
@@ -739,6 +733,7 @@ class Snapshot(_SnapshotBase):
                     "'min_read_timestamp' / 'max_staleness'"
                 )
 
+        self._transaction_read_timestamp = None
         self._strong = len(flagged) == 0
         self._read_timestamp = read_timestamp
         self._min_read_timestamp = min_read_timestamp
@@ -768,7 +763,9 @@ class Snapshot(_SnapshotBase):
             value = True
 
         options = TransactionOptions(
-            read_only=TransactionOptions.ReadOnly(**{key: value})
+            read_only=TransactionOptions.ReadOnly(
+                **{key: value, "return_read_timestamp": True}
+            )
         )
 
         if self._multi_use:
@@ -814,4 +811,5 @@ class Snapshot(_SnapshotBase):
                 allowed_exceptions={InternalServerError: _check_rst_stream_error},
             )
         self._transaction_id = response.id
+        self._transaction_read_timestamp = response.read_timestamp
         return self._transaction_id

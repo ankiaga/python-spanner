@@ -179,9 +179,12 @@ class Cursor(object):
         self._is_closed = True
 
     def _do_execute_update(self, transaction, sql, params):
+        self.connection._transaction = transaction
+        self.connection._spanner_rw_transaction_started = True
         self._result_set = transaction.execute_sql(
             sql, params=params, param_types=get_param_types(params)
         )
+        self.connection._spanner_rw_transaction_started = False
         self._itr = PeekIterator(self._result_set)
         self._row_count = _UNSET_COUNT
 
@@ -239,15 +242,18 @@ class Cursor(object):
         self._row_count = _UNSET_COUNT
 
         try:
+            parsed_statement = parse_utils.classify_statement(sql)
+            if parsed_statement.statement_type == StatementType.CLIENT_SIDE:
+                self._result_set = client_side_statement_executor.execute(
+                    self.connection, parsed_statement
+                )
+                if self._result_set is not None:
+                    self._itr = PeekIterator(self._result_set)
+                    return
+
             if self.connection.read_only:
                 self._handle_DQL(sql, args or None)
                 return
-
-            parsed_statement = parse_utils.classify_statement(sql)
-            if parsed_statement.statement_type == StatementType.CLIENT_SIDE:
-                return client_side_statement_executor.execute(
-                    self.connection, parsed_statement
-                )
             if parsed_statement.statement_type == StatementType.DDL:
                 self._batch_DDLs(sql)
                 if not self.connection._client_transaction_started:
@@ -492,7 +498,10 @@ class Cursor(object):
             with self.connection.database.snapshot(
                 **self.connection.staleness
             ) as snapshot:
+                self.connection._spanner_ro_transaction_started = True
+                self.connection._snapshot = snapshot
                 self._handle_DQL_with_snapshot(snapshot, sql, params)
+                self.connection._spanner_ro_transaction_started = False
 
     def __enter__(self):
         return self

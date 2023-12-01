@@ -107,6 +107,8 @@ class Connection:
         self._staleness = None
         self.request_priority = None
         self._transaction_begin_marked = False
+        self._spanner_rw_transaction_started = False
+        self._spanner_ro_transaction_started = False
 
     @property
     def autocommit(self):
@@ -149,17 +151,17 @@ class Connection:
         Returns:
             bool: True if Spanner transaction started, False otherwise.
         """
-        return (
-            self._transaction
-            and not self._transaction.committed
-            and not self._transaction.rolled_back
-        ) or (self._snapshot is not None)
+        return self._spanner_rw_transaction_started or self._spanner_ro_transaction_started
 
     @property
     def inside_transaction(self):
         """Deprecated property which won't be supported in future versions.
         Please use spanner_transaction_started property instead."""
-        return self._spanner_transaction_started
+        return (
+            self._transaction
+            and not self._transaction.committed
+            and not self._transaction.rolled_back
+        )
 
     @property
     def _client_transaction_started(self):
@@ -361,8 +363,9 @@ class Connection:
         :returns: A Cloud Spanner transaction object, ready to use.
         """
         if not self.read_only and self._client_transaction_started:
-            if not self._spanner_transaction_started:
+            if not self._spanner_rw_transaction_started:
                 self._transaction = self._session_checkout().transaction()
+                self._spanner_rw_transaction_started = True
                 self._transaction.begin()
 
             return self._transaction
@@ -377,10 +380,11 @@ class Connection:
         :returns: A Cloud Spanner snapshot object, ready to use.
         """
         if self.read_only and self._client_transaction_started:
-            if not self._snapshot:
+            if not self._spanner_ro_transaction_started:
                 self._snapshot = Snapshot(
                     self._session_checkout(), multi_use=True, **self.staleness
                 )
+                self._spanner_ro_transaction_started = True
                 self._snapshot.begin()
 
             return self._snapshot
@@ -391,7 +395,7 @@ class Connection:
         The connection will be unusable from this point forward. If the
         connection has an active transaction, it will be rolled back.
         """
-        if self._spanner_transaction_started and not self.read_only:
+        if self._spanner_rw_transaction_started:
             self._transaction.rollback()
 
         if self._own_pool and self.database:
@@ -432,10 +436,11 @@ class Connection:
         self.run_prior_DDL_statements()
         if self._spanner_transaction_started:
             try:
-                if self.read_only:
-                    self._snapshot = None
+                if self._spanner_ro_transaction_started:
+                    self._spanner_ro_transaction_started = False
                 else:
                     self._transaction.commit()
+                    self._spanner_rw_transaction_started = False
 
                 self._release_session()
                 self._statements = []
@@ -457,10 +462,11 @@ class Connection:
             return
 
         if self._spanner_transaction_started:
-            if self.read_only:
-                self._snapshot = None
+            if self._spanner_ro_transaction_started:
+                self._spanner_ro_transaction_started = False
             else:
                 self._transaction.rollback()
+                self._spanner_rw_transaction_started = False
 
             self._release_session()
             self._statements = []

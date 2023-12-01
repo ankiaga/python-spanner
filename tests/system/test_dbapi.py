@@ -25,6 +25,7 @@ from google.cloud.spanner_dbapi.connection import Connection, connect
 from google.cloud.spanner_dbapi.exceptions import ProgrammingError, OperationalError
 from google.cloud.spanner_v1 import JsonObject
 from google.cloud.spanner_v1 import gapic_version as package_version
+from google.api_core.datetime_helpers import DatetimeWithNanoseconds
 from . import _helpers
 
 DATABASE_NAME = "dbapi-txn"
@@ -161,6 +162,87 @@ class TestDbApi:
         cursor3.close()
         conn3.close()
         assert got_rows == [updated_row]
+
+    def test_commit_timestamp_client_side(self):
+        """Test executing SHOW_COMMIT_TIMESTAMP client side statement in a
+        transaction."""
+
+        self._cursor.execute(
+            """
+    INSERT INTO contacts (contact_id, first_name, last_name, email)
+    VALUES (2, 'first-name', 'last-name', 'test.email@domen.ru')
+        """
+        )
+        self._conn.commit()
+        self._cursor.execute("SHOW VARIABLE COMMIT_TIMESTAMP")
+
+        got_rows = self._cursor.fetchall()
+        assert len(got_rows) == 1
+        assert len(got_rows[0]) == 1
+        assert len(self._cursor.description) == 1
+        assert self._cursor.description[0].name == "SHOW_COMMIT_TIMESTAMP"
+        assert isinstance(got_rows[0][0], DatetimeWithNanoseconds)
+
+    def test_commit_timestamp_client_side_autocommit(self):
+        """Test executing SHOW_COMMIT_TIMESTAMP client side statement in a
+        transaction when connection is in autocommit mode."""
+
+        self._conn.autocommit = True
+        self._cursor.execute(
+            """
+    INSERT INTO contacts (contact_id, first_name, last_name, email)
+    VALUES (2, 'first-name', 'last-name', 'test.email@domen.ru')
+        """
+        )
+        self._cursor.execute("SHOW VARIABLE COMMIT_TIMESTAMP")
+
+        got_rows = self._cursor.fetchall()
+        assert len(got_rows) == 1
+        assert len(got_rows[0]) == 1
+        assert len(self._cursor.description) == 1
+        assert self._cursor.description[0].name == "SHOW_COMMIT_TIMESTAMP"
+        assert isinstance(got_rows[0][0], DatetimeWithNanoseconds)
+
+    def test_read_timestamp_client_side(self):
+        """Test executing SHOW_READ_TIMESTAMP client side statement in a
+        transaction."""
+
+        self._conn.read_only = True
+
+        self._cursor.execute("SELECT * FROM contacts")
+        self._cursor.execute("SELECT * FROM contacts")
+        self._conn.commit()
+        self._cursor.execute("SHOW VARIABLE READ_TIMESTAMP")
+
+        got_rows = self._cursor.fetchall()
+        assert len(got_rows) == 1
+        assert len(got_rows[0]) == 1
+        assert len(self._cursor.description) == 1
+        assert self._cursor.description[0].name == "SHOW_READ_TIMESTAMP"
+        assert isinstance(got_rows[0][0], DatetimeWithNanoseconds)
+
+    def test_read_timestamp_client_side_autocommit(self):
+        """Test executing SHOW_READ_TIMESTAMP client side statement in a
+        transaction when connection is in autocommit mode."""
+
+        self._conn.autocommit = True
+
+        self._cursor.execute(
+            """
+    INSERT INTO contacts (contact_id, first_name, last_name, email)
+    VALUES (2, 'first-name', 'last-name', 'test.email@domen.ru')
+        """
+        )
+        self._conn.read_only = True
+        self._cursor.execute("SELECT * FROM contacts")
+        self._cursor.execute("SHOW VARIABLE READ_TIMESTAMP")
+
+        got_rows = self._cursor.fetchall()
+        assert len(got_rows) == 1
+        assert len(got_rows[0]) == 1
+        assert len(self._cursor.description) == 1
+        assert self._cursor.description[0].name == "SHOW_READ_TIMESTAMP"
+        assert isinstance(got_rows[0][0], DatetimeWithNanoseconds)
 
     def test_begin_success_post_commit(self):
         """Test beginning a new transaction post commiting an existing transaction
