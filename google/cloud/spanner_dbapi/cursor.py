@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Database cursor for Google Cloud Spanner DB API."""
-
+import itertools
 from collections import namedtuple
 
 import sqlparse
@@ -46,6 +46,9 @@ from google.cloud.spanner_dbapi.parsed_statement import (
     StatementType,
     Statement,
     ParsedStatement,
+)
+from google.cloud.spanner_dbapi.transaction_helper import (
+    _get_single_statement_result_checksum,
 )
 from google.cloud.spanner_dbapi.utils import PeekIterator
 from google.cloud.spanner_dbapi.utils import StreamedManyResultSets
@@ -90,9 +93,8 @@ class Cursor(object):
         self._row_count = _UNSET_COUNT
         self.lastrowid = None
         self.connection = connection
+        self.transaction_helper = self.connection._transaction_helper
         self._is_closed = False
-        # the currently running SQL statement results checksum
-        self._checksum = None
         # the number of rows to fetch at a time with fetchmany()
         self.arraysize = 1
 
@@ -275,26 +277,22 @@ class Cursor(object):
         # For every other operation, we've got to ensure that
         # any prior DDL statements were run.
         self.connection.run_prior_DDL_statements()
+        statement = parsed_statement.statement
         if self.connection._client_transaction_started:
-            (
-                self._result_set,
-                self._checksum,
-            ) = self.connection.run_statement(parsed_statement.statement)
-
             while True:
                 try:
-                    self._itr = PeekIterator(self._result_set)
-                    break
+                    self._result_set = self.connection.run_statement(statement)
+                    itr, self._itr = itertools.tee(PeekIterator(self._result_set), 2)
+                    statement.checksum = _get_single_statement_result_checksum(itr)
+                    self.transaction_helper._single_statements.append(statement)
+                    return
                 except Aborted:
-                    self.connection.retry_transaction()
-                except Exception as ex:
-                    self.connection._statements.remove(parsed_statement.statement)
-                    raise ex
+                    self.transaction_helper.retry_transaction()
         else:
             self.connection.database.run_in_transaction(
                 self._do_execute_update_in_autocommit,
-                parsed_statement.statement.sql,
-                parsed_statement.statement.params or None,
+                statement.sql,
+                statement.params or None,
             )
 
     @check_not_closed
@@ -357,17 +355,12 @@ class Cursor(object):
         sequence, or None when no more data is available."""
         try:
             res = next(self)
-            if (
-                self.connection._client_transaction_started
-                and not self.connection.read_only
-            ):
-                self._checksum.consume_result(res)
             return res
         except StopIteration:
             return
         except Aborted:
             if not self.connection.read_only:
-                self.connection.retry_transaction()
+                self.transaction_helper.retry_transaction()
                 return self.fetchone()
 
     @check_not_closed
@@ -378,15 +371,10 @@ class Cursor(object):
         res = []
         try:
             for row in self:
-                if (
-                    self.connection._client_transaction_started
-                    and not self.connection.read_only
-                ):
-                    self._checksum.consume_result(row)
                 res.append(row)
         except Aborted:
             if not self.connection.read_only:
-                self.connection.retry_transaction()
+                self.transaction_helper.retry_transaction()
                 return self.fetchall()
 
         return res
@@ -410,17 +398,12 @@ class Cursor(object):
         for _ in range(size):
             try:
                 res = next(self)
-                if (
-                    self.connection._client_transaction_started
-                    and not self.connection.read_only
-                ):
-                    self._checksum.consume_result(res)
                 items.append(res)
             except StopIteration:
                 break
             except Aborted:
                 if not self.connection.read_only:
-                    self.connection.retry_transaction()
+                    self.transaction_helper.retry_transaction()
                     return self.fetchmany(size)
 
         return items
