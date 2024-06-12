@@ -13,8 +13,6 @@
 # limitations under the License.
 
 import datetime
-import hashlib
-import pickle
 import pytest
 import time
 
@@ -89,25 +87,11 @@ class TestDbApi:
                 VALUES (1, 'first-name', 'last-name', 'test.email@domen.ru')
                 """
         )
-        cursor.execute(
-            """
-                UPDATE contacts
-                SET first_name = 'updated-first-name'
-                WHERE first_name = 'first-name'
-                """
-        )
-        cursor.execute(
-            """
-                UPDATE contacts
-                SET email = 'test.email_updated@domen.ru'
-                WHERE email = 'test.email@domen.ru'
-                """
-        )
         return (
             1,
-            "updated-first-name",
+            "first-name",
             "last-name",
-            "test.email_updated@domen.ru",
+            "test.email@domen.ru",
         )
 
     @pytest.mark.parametrize("client_side", [True, False])
@@ -126,7 +110,6 @@ class TestDbApi:
 
         assert got_rows == [updated_row]
 
-    @pytest.mark.skip(reason="b/315807641")
     def test_commit_exception(self):
         """Test that if exception during commit method is caught, then
         subsequent operations on same Cursor and Connection object works
@@ -148,7 +131,6 @@ class TestDbApi:
 
         assert got_rows == [updated_row]
 
-    @pytest.mark.skip(reason="b/315807641")
     def test_rollback_exception(self):
         """Test that if exception during rollback method is caught, then
         subsequent operations on same Cursor and Connection object works
@@ -170,7 +152,6 @@ class TestDbApi:
 
         assert got_rows == [updated_row]
 
-    @pytest.mark.skip(reason="b/315807641")
     def test_cursor_execute_exception(self):
         """Test that if exception in Cursor's execute method is caught when
         Connection is not in autocommit mode, then subsequent operations on
@@ -690,32 +671,6 @@ class TestDbApi:
 
         cursor.close()
         conn.close()
-
-    def test_results_checksum(self):
-        """Test that results checksum is calculated properly."""
-
-        self._cursor.execute(
-            """
-    INSERT INTO contacts (contact_id, first_name, last_name, email)
-    VALUES
-    (1, 'first-name', 'last-name', 'test.email@domen.ru'),
-    (2, 'first-name2', 'last-name2', 'test.email2@domen.ru')
-        """
-        )
-        assert len(self._conn._statements) == 1
-        self._conn.commit()
-
-        self._cursor.execute("SELECT * FROM contacts")
-        got_rows = self._cursor.fetchall()
-
-        assert len(self._conn._statements) == 1
-        self._conn.commit()
-
-        checksum = hashlib.sha256()
-        checksum.update(pickle.dumps(got_rows[0]))
-        checksum.update(pickle.dumps(got_rows[1]))
-
-        assert self._cursor._checksum.checksum.digest() == checksum.digest()
 
     def test_execute_many(self):
         row_data = [

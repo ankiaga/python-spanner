@@ -13,7 +13,6 @@
 # limitations under the License.
 
 """DB-API Connection for the Google Cloud Spanner."""
-import time
 import warnings
 
 from google.api_core.exceptions import Aborted
@@ -21,13 +20,11 @@ from google.api_core.gapic_v1.client_info import ClientInfo
 from google.cloud import spanner_v1 as spanner
 from google.cloud.spanner_dbapi.batch_dml_executor import BatchMode, BatchDmlExecutor
 from google.cloud.spanner_dbapi.parsed_statement import ParsedStatement, Statement
+from google.cloud.spanner_dbapi.transaction_helper import TransactionHelper
 from google.cloud.spanner_v1 import RequestOptions
-from google.cloud.spanner_v1.session import _get_retry_delay
 from google.cloud.spanner_v1.snapshot import Snapshot
 from deprecated import deprecated
 
-from google.cloud.spanner_dbapi.checksum import _compare_checksums
-from google.cloud.spanner_dbapi.checksum import ResultsChecksum
 from google.cloud.spanner_dbapi.cursor import Cursor
 from google.cloud.spanner_dbapi.exceptions import (
     InterfaceError,
@@ -37,13 +34,10 @@ from google.cloud.spanner_dbapi.exceptions import (
 from google.cloud.spanner_dbapi.version import DEFAULT_USER_AGENT
 from google.cloud.spanner_dbapi.version import PY_VERSION
 
-from google.rpc.code_pb2 import ABORTED
-
 
 CLIENT_TRANSACTION_NOT_STARTED_WARNING = (
     "This method is non-operational as a transaction has not been started."
 )
-MAX_INTERNAL_RETRIES = 50
 
 
 def check_not_closed(function):
@@ -99,9 +93,6 @@ class Connection:
         self._transaction = None
         self._session = None
         self._snapshot = None
-        # SQL statements, which were executed
-        # within the current transaction
-        self._statements = []
 
         self.is_closed = False
         self._autocommit = False
@@ -118,6 +109,7 @@ class Connection:
         self._spanner_transaction_started = False
         self._batch_mode = BatchMode.NONE
         self._batch_dml_executor: BatchDmlExecutor = None
+        self._transaction_helper = TransactionHelper(self)
 
     @property
     def autocommit(self):
@@ -281,76 +273,6 @@ class Connection:
             self.database._pool.put(self._session)
         self._session = None
 
-    def retry_transaction(self):
-        """Retry the aborted transaction.
-
-        All the statements executed in the original transaction
-        will be re-executed in new one. Results checksums of the
-        original statements and the retried ones will be compared.
-
-        :raises: :class:`google.cloud.spanner_dbapi.exceptions.RetryAborted`
-            If results checksum of the retried statement is
-            not equal to the checksum of the original one.
-        """
-        attempt = 0
-        while True:
-            self._spanner_transaction_started = False
-            attempt += 1
-            if attempt > MAX_INTERNAL_RETRIES:
-                raise
-
-            try:
-                self._rerun_previous_statements()
-                break
-            except Aborted as exc:
-                delay = _get_retry_delay(exc.errors[0], attempt)
-                if delay:
-                    time.sleep(delay)
-
-    def _rerun_previous_statements(self):
-        """
-        Helper to run all the remembered statements
-        from the last transaction.
-        """
-        for statement in self._statements:
-            if isinstance(statement, list):
-                statements, checksum = statement
-
-                transaction = self.transaction_checkout()
-                statements_tuple = []
-                for single_statement in statements:
-                    statements_tuple.append(single_statement.get_tuple())
-                status, res = transaction.batch_update(statements_tuple)
-
-                if status.code == ABORTED:
-                    raise Aborted(status.details)
-
-                retried_checksum = ResultsChecksum()
-                retried_checksum.consume_result(res)
-                retried_checksum.consume_result(status.code)
-
-                _compare_checksums(checksum, retried_checksum)
-            else:
-                res_iter, retried_checksum = self.run_statement(statement, retried=True)
-                # executing all the completed statements
-                if statement != self._statements[-1]:
-                    for res in res_iter:
-                        retried_checksum.consume_result(res)
-
-                    _compare_checksums(statement.checksum, retried_checksum)
-                # executing the failed statement
-                else:
-                    # streaming up to the failed result or
-                    # to the end of the streaming iterator
-                    while len(retried_checksum) < len(statement.checksum):
-                        try:
-                            res = next(iter(res_iter))
-                            retried_checksum.consume_result(res)
-                        except StopIteration:
-                            break
-
-                    _compare_checksums(statement.checksum, retried_checksum)
-
     def transaction_checkout(self):
         """Get a Cloud Spanner transaction.
 
@@ -443,11 +365,12 @@ class Connection:
             if self._spanner_transaction_started and not self._read_only:
                 self._transaction.commit()
         except Aborted:
-            self.retry_transaction()
+            self._transaction_helper.retry_transaction()
             self.commit()
         finally:
             self._release_session()
-            self._statements = []
+            self._transaction_helper._single_statements = []
+            self._transaction_helper._batch_statements_list = []
             self._transaction_begin_marked = False
             self._spanner_transaction_started = False
 
@@ -467,7 +390,8 @@ class Connection:
                 self._transaction.rollback()
         finally:
             self._release_session()
-            self._statements = []
+            self._transaction_helper._single_statements = []
+            self._transaction_helper._batch_statements_list = []
             self._transaction_begin_marked = False
             self._spanner_transaction_started = False
 
@@ -486,7 +410,7 @@ class Connection:
 
             return self.database.update_ddl(ddl_statements).result()
 
-    def run_statement(self, statement: Statement, retried=False):
+    def run_statement(self, statement: Statement):
         """Run single SQL statement in begun transaction.
 
         This method is never used in autocommit mode. In
@@ -506,17 +430,11 @@ class Connection:
                   checksum of this statement results.
         """
         transaction = self.transaction_checkout()
-        if not retried:
-            self._statements.append(statement)
-
-        return (
-            transaction.execute_sql(
-                statement.sql,
-                statement.params,
-                param_types=statement.param_types,
-                request_options=self.request_options,
-            ),
-            ResultsChecksum() if retried else statement.checksum,
+        return transaction.execute_sql(
+            statement.sql,
+            statement.params,
+            param_types=statement.param_types,
+            request_options=self.request_options,
         )
 
     @check_not_closed

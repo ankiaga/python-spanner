@@ -17,6 +17,7 @@ from unittest import mock
 import sys
 import unittest
 
+from google.cloud.spanner_dbapi.checksum import ResultsChecksum
 from google.cloud.spanner_dbapi.parsed_statement import (
     ParsedStatement,
     StatementType,
@@ -44,7 +45,7 @@ class TestCursor(unittest.TestCase):
     def _transaction_mock(self, mock_response=[]):
         from google.rpc.code_pb2 import OK
 
-        transaction = mock.Mock(committed=False, rolled_back=False)
+        transaction = mock.Mock()
         transaction.batch_update = mock.Mock(
             return_value=[mock.Mock(code=OK), mock_response]
         )
@@ -175,8 +176,6 @@ class TestCursor(unittest.TestCase):
             cursor.execute(sql="SELECT 1")
 
     def test_execute_autocommit_off(self):
-        from google.cloud.spanner_dbapi.utils import PeekIterator
-
         connection = self._make_connection(self.INSTANCE, mock.MagicMock())
         cursor = self._make_one(connection)
         cursor.connection._autocommit = False
@@ -184,30 +183,24 @@ class TestCursor(unittest.TestCase):
 
         cursor.execute("sql")
         self.assertIsInstance(cursor._result_set, mock.MagicMock)
-        self.assertIsInstance(cursor._itr, PeekIterator)
 
     def test_execute_insert_statement_autocommit_off(self):
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.utils import PeekIterator
-
         connection = self._make_connection(self.INSTANCE, mock.MagicMock())
         cursor = self._make_one(connection)
         cursor.connection._autocommit = False
         cursor.connection.transaction_checkout = mock.MagicMock(autospec=True)
 
-        cursor._checksum = ResultsChecksum()
         sql = "INSERT INTO django_migrations (app, name, applied) VALUES (%s, %s, %s)"
         with mock.patch(
             "google.cloud.spanner_dbapi.parse_utils.classify_statement",
-            return_value=ParsedStatement(StatementType.UPDATE, sql),
+            return_value=ParsedStatement(StatementType.UPDATE, Statement(sql)),
         ):
             with mock.patch(
                 "google.cloud.spanner_dbapi.connection.Connection.run_statement",
-                return_value=(mock.MagicMock(), ResultsChecksum()),
+                return_value=(mock.MagicMock()),
             ):
                 cursor.execute(sql)
                 self.assertIsInstance(cursor._result_set, mock.MagicMock)
-                self.assertIsInstance(cursor._itr, PeekIterator)
 
     def test_execute_statement(self):
         connection = self._make_connection(self.INSTANCE, mock.MagicMock())
@@ -547,7 +540,7 @@ class TestCursor(unittest.TestCase):
         connection.autocommit = True
         cursor = connection.cursor()
 
-        transaction = mock.Mock(committed=False, rolled_back=False)
+        transaction = mock.Mock()
         transaction.batch_update = mock.Mock(
             return_value=(mock.Mock(code=UNKNOWN, message=err_details), [])
         )
@@ -565,7 +558,6 @@ class TestCursor(unittest.TestCase):
 
     def test_executemany_insert_batch_aborted(self):
         from google.cloud.spanner_dbapi import connect
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
         from google.cloud.spanner_v1.param_types import INT64
         from google.rpc.code_pb2 import ABORTED
 
@@ -574,7 +566,7 @@ class TestCursor(unittest.TestCase):
 
         connection = connect("test-instance", "test-database")
 
-        transaction1 = mock.Mock(committed=False, rolled_back=False)
+        transaction1 = mock.Mock()
         transaction1.batch_update = mock.Mock(
             side_effect=[(mock.Mock(code=ABORTED, message=err_details), [])]
         )
@@ -584,7 +576,7 @@ class TestCursor(unittest.TestCase):
         connection.transaction_checkout = mock.Mock(
             side_effect=[transaction1, transaction2]
         )
-        connection.retry_transaction = mock.Mock()
+        connection._transaction_helper.retry_transaction = mock.Mock()
 
         cursor = connection.cursor()
         cursor.executemany(sql, [(1, 2, 3, 4), (5, 6, 7, 8)])
@@ -617,10 +609,10 @@ class TestCursor(unittest.TestCase):
                 ),
             ]
         )
-        connection.retry_transaction.assert_called_once()
+        connection._transaction_helper.retry_transaction.assert_called_once()
 
         self.assertEqual(
-            connection._statements[0][0],
+            connection._transaction_helper._batch_statements_list[0][0],
             [
                 Statement(
                     """INSERT INTO table (col1, "col2", `col3`, `"col4"`) VALUES (@a0, @a1, @a2, @a3)""",
@@ -634,7 +626,9 @@ class TestCursor(unittest.TestCase):
                 ),
             ],
         )
-        self.assertIsInstance(connection._statements[0][1], ResultsChecksum)
+        self.assertIsInstance(
+            connection._transaction_helper._batch_statements_list[0][1], ResultsChecksum
+        )
 
     @mock.patch("google.cloud.spanner_v1.Client")
     def test_executemany_database_error(self, mock_client):
@@ -650,8 +644,6 @@ class TestCursor(unittest.TestCase):
         sys.version_info[0] < 3, "Python 2 has an outdated iterator definition"
     )
     def test_fetchone(self):
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-
         connection = self._make_connection(self.INSTANCE, mock.MagicMock())
         cursor = self._make_one(connection)
         cursor._checksum = ResultsChecksum()
@@ -665,8 +657,6 @@ class TestCursor(unittest.TestCase):
         sys.version_info[0] < 3, "Python 2 has an outdated iterator definition"
     )
     def test_fetchone_w_autocommit(self):
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-
         connection = self._make_connection(self.INSTANCE, mock.MagicMock())
         connection.autocommit = True
         cursor = self._make_one(connection)
@@ -678,8 +668,6 @@ class TestCursor(unittest.TestCase):
         self.assertIsNone(cursor.fetchone())
 
     def test_fetchmany(self):
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-
         connection = self._make_connection(self.INSTANCE, mock.MagicMock())
         cursor = self._make_one(connection)
         cursor._checksum = ResultsChecksum()
@@ -692,8 +680,6 @@ class TestCursor(unittest.TestCase):
         self.assertEqual(result, lst[1:])
 
     def test_fetchmany_w_autocommit(self):
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-
         connection = self._make_connection(self.INSTANCE, mock.MagicMock())
         connection.autocommit = True
         cursor = self._make_one(connection)
@@ -707,8 +693,6 @@ class TestCursor(unittest.TestCase):
         self.assertEqual(result, lst[1:])
 
     def test_fetchall(self):
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-
         connection = self._make_connection(self.INSTANCE, mock.MagicMock())
         cursor = self._make_one(connection)
         cursor._checksum = ResultsChecksum()
@@ -717,8 +701,6 @@ class TestCursor(unittest.TestCase):
         self.assertEqual(cursor.fetchall(), lst)
 
     def test_fetchall_w_autocommit(self):
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-
         connection = self._make_connection(self.INSTANCE, mock.MagicMock())
         connection.autocommit = True
         cursor = self._make_one(connection)
@@ -896,7 +878,10 @@ class TestCursor(unittest.TestCase):
             self.assertEqual(result, expected)
 
     @mock.patch("google.cloud.spanner_v1.Client")
-    def test_peek_iterator_aborted(self, mock_client):
+    @mock.patch(
+        "google.cloud.spanner_dbapi.cursor._get_single_statement_result_checksum"
+    )
+    def test_peek_iterator_aborted(self, mock_result_checksum, mock_client):
         """
         Checking that an Aborted exception is retried in case it happened
         while streaming the first element with a PeekIterator.
@@ -905,41 +890,38 @@ class TestCursor(unittest.TestCase):
         from google.cloud.spanner_dbapi.connection import connect
 
         connection = connect("test-instance", "test-database")
-
         cursor = connection.cursor()
         with mock.patch(
             "google.cloud.spanner_dbapi.utils.PeekIterator.__init__",
             side_effect=(Aborted("Aborted"), None),
         ):
             with mock.patch(
-                "google.cloud.spanner_dbapi.connection.Connection.retry_transaction"
+                "google.cloud.spanner_dbapi.transaction_helper.TransactionHelper.retry_transaction"
             ) as retry_mock:
                 with mock.patch(
                     "google.cloud.spanner_dbapi.connection.Connection.run_statement",
-                    return_value=((1, 2, 3), None),
+                    return_value=(1, 2, 3),
                 ):
                     cursor.execute("SELECT * FROM table_name")
 
-                retry_mock.assert_called_with()
+            retry_mock.assert_called_with()
 
     @mock.patch("google.cloud.spanner_v1.Client")
     def test_fetchone_retry_aborted(self, mock_client):
         """Check that aborted fetch re-executing transaction."""
         from google.api_core.exceptions import Aborted
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
         from google.cloud.spanner_dbapi.connection import connect
 
         connection = connect("test-instance", "test-database")
 
         cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
 
         with mock.patch(
             "google.cloud.spanner_dbapi.cursor.Cursor.__next__",
             side_effect=(Aborted("Aborted"), None),
         ):
             with mock.patch(
-                "google.cloud.spanner_dbapi.connection.Connection.retry_transaction"
+                "google.cloud.spanner_dbapi.transaction_helper.TransactionHelper.retry_transaction"
             ) as retry_mock:
                 cursor.fetchone()
 
@@ -953,15 +935,15 @@ class TestCursor(unittest.TestCase):
         from google.cloud.spanner_dbapi.connection import connect
         from google.cloud.spanner_dbapi.cursor import Statement
 
-        row = ["field1", "field2"]
+        row = ("field1", "field2")
         connection = connect("test-instance", "test-database")
 
         cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
-        cursor._checksum.consume_result(row)
+        checksum = ResultsChecksum()
+        checksum.consume_result(row)
 
-        statement = Statement("SELECT 1", [], {}, cursor._checksum)
-        connection._statements.append(statement)
+        statement = Statement("SELECT 1", [], {}, checksum)
+        connection._transaction_helper._single_statements.append(statement)
 
         with mock.patch(
             "google.cloud.spanner_dbapi.cursor.Cursor.__next__",
@@ -969,11 +951,11 @@ class TestCursor(unittest.TestCase):
         ):
             with mock.patch(
                 "google.cloud.spanner_dbapi.connection.Connection.run_statement",
-                return_value=([row], ResultsChecksum()),
+                return_value=([row]),
             ) as run_mock:
                 cursor.fetchone()
 
-                run_mock.assert_called_with(statement, retried=True)
+                run_mock.assert_called_with(statement)
 
     @mock.patch("google.cloud.spanner_v1.Client")
     def test_fetchone_retry_aborted_statements_checksums_mismatch(self, mock_client):
@@ -984,17 +966,17 @@ class TestCursor(unittest.TestCase):
         from google.cloud.spanner_dbapi.connection import connect
         from google.cloud.spanner_dbapi.cursor import Statement
 
-        row = ["field1", "field2"]
-        row2 = ["updated_field1", "field2"]
+        row = ("field1", "field2")
+        row2 = ("updated_field1", "field2")
 
         connection = connect("test-instance", "test-database")
 
         cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
-        cursor._checksum.consume_result(row)
+        checksum = ResultsChecksum()
+        checksum.consume_result(row)
 
-        statement = Statement("SELECT 1", [], {}, cursor._checksum)
-        connection._statements.append(statement)
+        statement = Statement("SELECT 1", [], {}, checksum)
+        connection._transaction_helper._single_statements.append(statement)
 
         with mock.patch(
             "google.cloud.spanner_dbapi.cursor.Cursor.__next__",
@@ -1002,31 +984,28 @@ class TestCursor(unittest.TestCase):
         ):
             with mock.patch(
                 "google.cloud.spanner_dbapi.connection.Connection.run_statement",
-                return_value=([row2], ResultsChecksum()),
+                return_value=([row2]),
             ) as run_mock:
                 with self.assertRaises(RetryAborted):
                     cursor.fetchone()
 
-                run_mock.assert_called_with(statement, retried=True)
+                run_mock.assert_called_with(statement)
 
     @mock.patch("google.cloud.spanner_v1.Client")
     def test_fetchall_retry_aborted(self, mock_client):
         """Check that aborted fetch re-executing transaction."""
         from google.api_core.exceptions import Aborted
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
         from google.cloud.spanner_dbapi.connection import connect
 
         connection = connect("test-instance", "test-database")
 
         cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
-
         with mock.patch(
             "google.cloud.spanner_dbapi.cursor.Cursor.__iter__",
             side_effect=(Aborted("Aborted"), iter([])),
         ):
             with mock.patch(
-                "google.cloud.spanner_dbapi.connection.Connection.retry_transaction"
+                "google.cloud.spanner_dbapi.transaction_helper.TransactionHelper.retry_transaction"
             ) as retry_mock:
                 cursor.fetchall()
 
@@ -1040,15 +1019,15 @@ class TestCursor(unittest.TestCase):
         from google.cloud.spanner_dbapi.connection import connect
         from google.cloud.spanner_dbapi.cursor import Statement
 
-        row = ["field1", "field2"]
+        row = ("field1", "field2")
         connection = connect("test-instance", "test-database")
 
         cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
-        cursor._checksum.consume_result(row)
+        checksum = ResultsChecksum()
+        checksum.consume_result(row)
 
-        statement = Statement("SELECT 1", [], {}, cursor._checksum)
-        connection._statements.append(statement)
+        statement = Statement("SELECT 1", [], {}, checksum)
+        connection._transaction_helper._single_statements.append(statement)
 
         with mock.patch(
             "google.cloud.spanner_dbapi.cursor.Cursor.__iter__",
@@ -1056,11 +1035,11 @@ class TestCursor(unittest.TestCase):
         ):
             with mock.patch(
                 "google.cloud.spanner_dbapi.connection.Connection.run_statement",
-                return_value=([row], ResultsChecksum()),
+                return_value=[row],
             ) as run_mock:
                 cursor.fetchall()
 
-                run_mock.assert_called_with(statement, retried=True)
+                run_mock.assert_called_with(statement)
 
     @mock.patch("google.cloud.spanner_v1.Client")
     def test_fetchall_retry_aborted_statements_checksums_mismatch(self, mock_client):
@@ -1071,17 +1050,17 @@ class TestCursor(unittest.TestCase):
         from google.cloud.spanner_dbapi.connection import connect
         from google.cloud.spanner_dbapi.cursor import Statement
 
-        row = ["field1", "field2"]
-        row2 = ["updated_field1", "field2"]
+        row = ("field1", "field2")
+        row2 = ("updated_field1", "field2")
 
         connection = connect("test-instance", "test-database")
 
         cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
-        cursor._checksum.consume_result(row)
+        checksum = ResultsChecksum()
+        checksum.consume_result(row)
 
-        statement = Statement("SELECT 1", [], {}, cursor._checksum)
-        connection._statements.append(statement)
+        statement = Statement("SELECT 1", [], {}, checksum)
+        connection._transaction_helper._single_statements.append(statement)
 
         with mock.patch(
             "google.cloud.spanner_dbapi.cursor.Cursor.__iter__",
@@ -1089,31 +1068,29 @@ class TestCursor(unittest.TestCase):
         ):
             with mock.patch(
                 "google.cloud.spanner_dbapi.connection.Connection.run_statement",
-                return_value=([row2], ResultsChecksum()),
+                return_value=[row2],
             ) as run_mock:
                 with self.assertRaises(RetryAborted):
                     cursor.fetchall()
 
-                run_mock.assert_called_with(statement, retried=True)
+                run_mock.assert_called_with(statement)
 
     @mock.patch("google.cloud.spanner_v1.Client")
     def test_fetchmany_retry_aborted(self, mock_client):
         """Check that aborted fetch re-executing transaction."""
         from google.api_core.exceptions import Aborted
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
         from google.cloud.spanner_dbapi.connection import connect
 
         connection = connect("test-instance", "test-database")
 
         cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
 
         with mock.patch(
             "google.cloud.spanner_dbapi.cursor.Cursor.__next__",
             side_effect=(Aborted("Aborted"), None),
         ):
             with mock.patch(
-                "google.cloud.spanner_dbapi.connection.Connection.retry_transaction"
+                "google.cloud.spanner_dbapi.transaction_helper.TransactionHelper.retry_transaction"
             ) as retry_mock:
                 cursor.fetchmany()
 
@@ -1127,15 +1104,15 @@ class TestCursor(unittest.TestCase):
         from google.cloud.spanner_dbapi.connection import connect
         from google.cloud.spanner_dbapi.cursor import Statement
 
-        row = ["field1", "field2"]
+        row = ("field1", "field2")
         connection = connect("test-instance", "test-database")
 
         cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
-        cursor._checksum.consume_result(row)
+        checksum = ResultsChecksum()
+        checksum.consume_result(row)
 
-        statement = Statement("SELECT 1", [], {}, cursor._checksum)
-        connection._statements.append(statement)
+        statement = Statement("SELECT 1", [], {}, checksum)
+        connection._transaction_helper._single_statements.append(statement)
 
         with mock.patch(
             "google.cloud.spanner_dbapi.cursor.Cursor.__next__",
@@ -1143,11 +1120,11 @@ class TestCursor(unittest.TestCase):
         ):
             with mock.patch(
                 "google.cloud.spanner_dbapi.connection.Connection.run_statement",
-                return_value=([row], ResultsChecksum()),
+                return_value=([row]),
             ) as run_mock:
                 cursor.fetchmany(len(row))
 
-                run_mock.assert_called_with(statement, retried=True)
+                run_mock.assert_called_with(statement)
 
     @mock.patch("google.cloud.spanner_v1.Client")
     def test_fetchmany_retry_aborted_statements_checksums_mismatch(self, mock_client):
@@ -1158,17 +1135,17 @@ class TestCursor(unittest.TestCase):
         from google.cloud.spanner_dbapi.connection import connect
         from google.cloud.spanner_dbapi.cursor import Statement
 
-        row = ["field1", "field2"]
-        row2 = ["updated_field1", "field2"]
+        row = ("field1", "field2")
+        row2 = ("updated_field1", "field2")
 
         connection = connect("test-instance", "test-database")
 
         cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
-        cursor._checksum.consume_result(row)
+        checksum = ResultsChecksum()
+        checksum.consume_result(row)
 
-        statement = Statement("SELECT 1", [], {}, cursor._checksum)
-        connection._statements.append(statement)
+        statement = Statement("SELECT 1", [], {}, checksum)
+        connection._transaction_helper._single_statements.append(statement)
 
         with mock.patch(
             "google.cloud.spanner_dbapi.cursor.Cursor.__next__",
@@ -1176,12 +1153,12 @@ class TestCursor(unittest.TestCase):
         ):
             with mock.patch(
                 "google.cloud.spanner_dbapi.connection.Connection.run_statement",
-                return_value=([row2], ResultsChecksum()),
+                return_value=([row2]),
             ) as run_mock:
                 with self.assertRaises(RetryAborted):
                     cursor.fetchmany(len(row))
 
-                run_mock.assert_called_with(statement, retried=True)
+                run_mock.assert_called_with(statement)
 
     @mock.patch("google.cloud.spanner_v1.Client")
     def test_ddls_with_semicolon(self, mock_client):

@@ -16,7 +16,6 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import TYPE_CHECKING, List
-from google.cloud.spanner_dbapi.checksum import ResultsChecksum
 from google.cloud.spanner_dbapi.parsed_statement import (
     ParsedStatement,
     StatementType,
@@ -25,6 +24,9 @@ from google.cloud.spanner_dbapi.parsed_statement import (
 from google.rpc.code_pb2 import ABORTED, OK
 from google.api_core.exceptions import Aborted
 
+from google.cloud.spanner_dbapi.transaction_helper import (
+    _get_batch_statements_result_checksum,
+)
 from google.cloud.spanner_dbapi.utils import StreamedManyResultSets
 
 if TYPE_CHECKING:
@@ -81,6 +83,7 @@ def run_batch_dml(cursor: "Cursor", statements: List[Statement]):
     from google.cloud.spanner_dbapi import OperationalError
 
     connection = cursor.connection
+    transaction_helper = connection._transaction_helper
     many_result_set = StreamedManyResultSets()
     statements_tuple = []
     for statement in statements:
@@ -90,28 +93,23 @@ def run_batch_dml(cursor: "Cursor", statements: List[Statement]):
         many_result_set.add_iter(res)
         cursor._row_count = sum([max(val, 0) for val in res])
     else:
-        retried = False
         while True:
             try:
                 transaction = connection.transaction_checkout()
                 status, res = transaction.batch_update(statements_tuple)
-                many_result_set.add_iter(res)
-                res_checksum = ResultsChecksum()
-                res_checksum.consume_result(res)
-                res_checksum.consume_result(status.code)
-                if not retried:
-                    connection._statements.append((statements, res_checksum))
-                cursor._row_count = sum([max(val, 0) for val in res])
-
                 if status.code == ABORTED:
                     connection._transaction = None
                     raise Aborted(status.message)
                 elif status.code != OK:
                     raise OperationalError(status.message)
+
+                checksum = _get_batch_statements_result_checksum(res, status.code)
+                many_result_set.add_iter(res)
+                transaction_helper._batch_statements_list.append((statements, checksum))
+                cursor._row_count = sum([max(val, 0) for val in res])
                 return many_result_set
             except Aborted:
-                connection.retry_transaction()
-                retried = True
+                transaction_helper.retry_transaction()
 
 
 def _do_batch_update(transaction, statements):

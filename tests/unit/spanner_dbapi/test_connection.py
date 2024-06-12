@@ -492,83 +492,6 @@ class TestConnection(unittest.TestCase):
 
         self.assertEqual(self._under_test._transaction_begin_marked, True)
 
-    def test_run_statement_wo_retried(self):
-        """Check that Connection remembers executed statements."""
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-
-        sql = """SELECT 23 FROM table WHERE id = @a1"""
-        params = {"a1": "value"}
-        param_types = {"a1": str}
-
-        connection = self._make_connection()
-        connection.transaction_checkout = mock.Mock()
-        statement = Statement(sql, params, param_types, ResultsChecksum())
-        connection.run_statement(statement)
-
-        self.assertEqual(connection._statements[0].sql, sql)
-        self.assertEqual(connection._statements[0].params, params)
-        self.assertEqual(connection._statements[0].param_types, param_types)
-        self.assertIsInstance(connection._statements[0].checksum, ResultsChecksum)
-
-    def test_run_statement_w_retried(self):
-        """Check that Connection doesn't remember re-executed statements."""
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-
-        sql = """SELECT 23 FROM table WHERE id = @a1"""
-        params = {"a1": "value"}
-        param_types = {"a1": str}
-
-        connection = self._make_connection()
-        connection.transaction_checkout = mock.Mock()
-        statement = Statement(sql, params, param_types, ResultsChecksum())
-        connection.run_statement(statement, retried=True)
-
-        self.assertEqual(len(connection._statements), 0)
-
-    def test_run_statement_w_heterogenous_insert_statements(self):
-        """Check that Connection executed heterogenous insert statements."""
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-        from google.rpc.status_pb2 import Status
-        from google.rpc.code_pb2 import OK
-
-        sql = "INSERT INTO T (f1, f2) VALUES (1, 2)"
-        params = None
-        param_types = None
-
-        connection = self._make_connection()
-        transaction = mock.MagicMock()
-        connection.transaction_checkout = mock.Mock(return_value=transaction)
-        transaction.batch_update = mock.Mock(return_value=(Status(code=OK), 1))
-        statement = Statement(sql, params, param_types, ResultsChecksum())
-
-        connection.run_statement(statement, retried=True)
-
-        self.assertEqual(len(connection._statements), 0)
-
-    def test_run_statement_w_homogeneous_insert_statements(self):
-        """Check that Connection executed homogeneous insert statements."""
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-        from google.rpc.status_pb2 import Status
-        from google.rpc.code_pb2 import OK
-
-        sql = "INSERT INTO T (f1, f2) VALUES (%s, %s), (%s, %s)"
-        params = ["a", "b", "c", "d"]
-        param_types = {"f1": str, "f2": str}
-
-        connection = self._make_connection()
-        transaction = mock.MagicMock()
-        connection.transaction_checkout = mock.Mock(return_value=transaction)
-        transaction.batch_update = mock.Mock(return_value=(Status(code=OK), 1))
-        statement = Statement(sql, params, param_types, ResultsChecksum())
-
-        connection.run_statement(statement, retried=True)
-
-        self.assertEqual(len(connection._statements), 0)
-
     @mock.patch("google.cloud.spanner_v1.transaction.Transaction")
     def test_commit_clears_statements(self, mock_transaction):
         """
@@ -578,13 +501,13 @@ class TestConnection(unittest.TestCase):
         connection = self._make_connection()
         connection._spanner_transaction_started = True
         connection._transaction = mock.Mock()
-        connection._statements = [{}, {}]
+        connection._transaction_helper._single_statements = [{}, {}]
 
-        self.assertEqual(len(connection._statements), 2)
+        self.assertEqual(len(connection._transaction_helper._single_statements), 2)
 
         connection.commit()
 
-        self.assertEqual(len(connection._statements), 0)
+        self.assertEqual(len(connection._transaction_helper._single_statements), 0)
 
     @mock.patch("google.cloud.spanner_v1.transaction.Transaction")
     def test_rollback_clears_statements(self, mock_transaction):
@@ -595,244 +518,30 @@ class TestConnection(unittest.TestCase):
         connection = self._make_connection()
         connection._spanner_transaction_started = True
         connection._transaction = mock_transaction
-        connection._statements = [{}, {}]
+        connection._transaction_helper._single_statements = [{}, {}]
 
-        self.assertEqual(len(connection._statements), 2)
+        self.assertEqual(len(connection._transaction_helper._single_statements), 2)
 
         connection.rollback()
 
-        self.assertEqual(len(connection._statements), 0)
-
-    def test_retry_transaction_w_checksum_match(self):
-        """Check retrying an aborted transaction."""
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-
-        row = ["field1", "field2"]
-        connection = self._make_connection()
-        checksum = ResultsChecksum()
-        checksum.consume_result(row)
-
-        retried_checkum = ResultsChecksum()
-        run_mock = connection.run_statement = mock.Mock()
-        run_mock.return_value = ([row], retried_checkum)
-
-        statement = Statement("SELECT 1", [], {}, checksum)
-        connection._statements.append(statement)
-
-        with mock.patch(
-            "google.cloud.spanner_dbapi.connection._compare_checksums"
-        ) as compare_mock:
-            connection.retry_transaction()
-
-        compare_mock.assert_called_with(checksum, retried_checkum)
-        run_mock.assert_called_with(statement, retried=True)
-
-    def test_retry_transaction_w_checksum_mismatch(self):
-        """
-        Check retrying an aborted transaction
-        with results checksums mismatch.
-        """
-        from google.cloud.spanner_dbapi.exceptions import RetryAborted
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-
-        row = ["field1", "field2"]
-        retried_row = ["field3", "field4"]
-        connection = self._make_connection()
-
-        checksum = ResultsChecksum()
-        checksum.consume_result(row)
-        retried_checkum = ResultsChecksum()
-        run_mock = connection.run_statement = mock.Mock()
-        run_mock.return_value = ([retried_row], retried_checkum)
-
-        statement = Statement("SELECT 1", [], {}, checksum)
-        connection._statements.append(statement)
-
-        with self.assertRaises(RetryAborted):
-            connection.retry_transaction()
+        self.assertEqual(len(connection._transaction_helper._single_statements), 0)
 
     @mock.patch("google.cloud.spanner_v1.Client")
     def test_commit_retry_aborted_statements(self, mock_client):
         """Check that retried transaction executing the same statements."""
         from google.api_core.exceptions import Aborted
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
         from google.cloud.spanner_dbapi.connection import connect
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-
-        row = ["field1", "field2"]
 
         connection = connect("test-instance", "test-database")
-
-        cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
-        cursor._checksum.consume_result(row)
-
-        statement = Statement("SELECT 1", [], {}, cursor._checksum)
-        connection._statements.append(statement)
         mock_transaction = mock.Mock()
         connection._spanner_transaction_started = True
         connection._transaction = mock_transaction
         mock_transaction.commit.side_effect = [Aborted("Aborted"), None]
-        run_mock = connection.run_statement = mock.Mock()
-        run_mock.return_value = ([row], ResultsChecksum())
+        run_mock = connection._transaction_helper = mock.Mock()
 
         connection.commit()
 
-        run_mock.assert_called_with(statement, retried=True)
-
-    @mock.patch("google.cloud.spanner_v1.Client")
-    def test_retry_aborted_retry(self, mock_client):
-        """
-        Check that in case of a retried transaction failed,
-        the connection will retry it once again.
-        """
-        from google.api_core.exceptions import Aborted
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.connection import connect
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-
-        row = ["field1", "field2"]
-
-        connection = connect("test-instance", "test-database")
-
-        cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
-        cursor._checksum.consume_result(row)
-
-        statement = Statement("SELECT 1", [], {}, cursor._checksum)
-        connection._statements.append(statement)
-        metadata_mock = mock.Mock()
-        metadata_mock.trailing_metadata.return_value = {}
-        run_mock = connection.run_statement = mock.Mock()
-        run_mock.side_effect = [
-            Aborted("Aborted", errors=[metadata_mock]),
-            ([row], ResultsChecksum()),
-        ]
-
-        connection.retry_transaction()
-
-        run_mock.assert_has_calls(
-            (
-                mock.call(statement, retried=True),
-                mock.call(statement, retried=True),
-            )
-        )
-
-    def test_retry_transaction_raise_max_internal_retries(self):
-        """Check retrying raise an error of max internal retries."""
-        from google.cloud.spanner_dbapi import connection as conn
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-
-        conn.MAX_INTERNAL_RETRIES = 0
-        row = ["field1", "field2"]
-        connection = self._make_connection()
-
-        checksum = ResultsChecksum()
-        checksum.consume_result(row)
-
-        statement = Statement("SELECT 1", [], {}, checksum)
-        connection._statements.append(statement)
-
-        with self.assertRaises(Exception):
-            connection.retry_transaction()
-
-        conn.MAX_INTERNAL_RETRIES = 50
-
-    @mock.patch("google.cloud.spanner_v1.Client")
-    def test_retry_aborted_retry_without_delay(self, mock_client):
-        """
-        Check that in case of a retried transaction failed,
-        the connection will retry it once again.
-        """
-        from google.api_core.exceptions import Aborted
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.connection import connect
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-
-        row = ["field1", "field2"]
-
-        connection = connect("test-instance", "test-database")
-
-        cursor = connection.cursor()
-        cursor._checksum = ResultsChecksum()
-        cursor._checksum.consume_result(row)
-
-        statement = Statement("SELECT 1", [], {}, cursor._checksum)
-        connection._statements.append(statement)
-        metadata_mock = mock.Mock()
-        metadata_mock.trailing_metadata.return_value = {}
-        run_mock = connection.run_statement = mock.Mock()
-        run_mock.side_effect = [
-            Aborted("Aborted", errors=[metadata_mock]),
-            ([row], ResultsChecksum()),
-        ]
-        connection._get_retry_delay = mock.Mock(return_value=False)
-
-        connection.retry_transaction()
-
-        run_mock.assert_has_calls(
-            (
-                mock.call(statement, retried=True),
-                mock.call(statement, retried=True),
-            )
-        )
-
-    def test_retry_transaction_w_multiple_statement(self):
-        """Check retrying an aborted transaction."""
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-
-        row = ["field1", "field2"]
-        connection = self._make_connection()
-
-        checksum = ResultsChecksum()
-        checksum.consume_result(row)
-        retried_checkum = ResultsChecksum()
-
-        statement = Statement("SELECT 1", [], {}, checksum)
-        statement1 = Statement("SELECT 2", [], {}, checksum)
-        connection._statements.append(statement)
-        connection._statements.append(statement1)
-        run_mock = connection.run_statement = mock.Mock()
-        run_mock.return_value = ([row], retried_checkum)
-
-        with mock.patch(
-            "google.cloud.spanner_dbapi.connection._compare_checksums"
-        ) as compare_mock:
-            connection.retry_transaction()
-
-        compare_mock.assert_called_with(checksum, retried_checkum)
-
-        run_mock.assert_called_with(statement1, retried=True)
-
-    def test_retry_transaction_w_empty_response(self):
-        """Check retrying an aborted transaction."""
-        from google.cloud.spanner_dbapi.checksum import ResultsChecksum
-        from google.cloud.spanner_dbapi.parsed_statement import Statement
-
-        row = []
-        connection = self._make_connection()
-
-        checksum = ResultsChecksum()
-        checksum.count = 1
-        retried_checkum = ResultsChecksum()
-
-        statement = Statement("SELECT 1", [], {}, checksum)
-        connection._statements.append(statement)
-        run_mock = connection.run_statement = mock.Mock()
-        run_mock.return_value = ([row], retried_checkum)
-
-        with mock.patch(
-            "google.cloud.spanner_dbapi.connection._compare_checksums"
-        ) as compare_mock:
-            connection.retry_transaction()
-
-        compare_mock.assert_called_with(checksum, retried_checkum)
-
-        run_mock.assert_called_with(statement, retried=True)
+        assert run_mock.retry_transaction.called
 
     def test_validate_ok(self):
         connection = self._make_connection()
